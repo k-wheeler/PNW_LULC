@@ -62,9 +62,10 @@ class _MLPClassifier:
         return e / e.sum(axis=1, keepdims=True)
 
 
-def fit_mlp(x_train, y_train, groups=None, val_fraction=0.2, hidden_dims=(128, 64),
-            dropout=0.3, epochs=50, batch_size=256, lr=1e-3, weight_decay=0.0,
-            balance_classes=True, random_state=1234, device=None, verbose=False):
+def fit_mlp(x_train, y_train, groups=None, val_fraction=0.2, early_stopping_rounds=None,
+            hidden_dims=(128, 64), dropout=0.3, epochs=50, batch_size=256, lr=1e-3,
+            weight_decay=0.0, balance_classes=True, random_state=1234, device=None,
+            verbose=False):
     """Train a shallow MLP on the embedding features.
 
     Args:
@@ -76,9 +77,15 @@ def fit_mlp(x_train, y_train, groups=None, val_fraction=0.2, hidden_dims=(128, 6
             the remaining rows. If None, trains on all rows and .history_['val']
             is None.
         val_fraction: Fraction of groups held out for the validation curve.
+        early_stopping_rounds: If set (and groups is provided), stop when the
+            validation loss hasn't improved for this many epochs and restore the
+            best-epoch weights; the chosen epoch is stored on .best_epoch_.
+            Requires the grouped val split, so it is ignored when groups is None.
+            The plain MLP leaves this None (trains the full `epochs`).
         hidden_dims: Sizes of the hidden layers (default (128, 64)).
         dropout: Dropout probability applied after each hidden layer.
-        epochs, batch_size, lr, weight_decay: Training hyperparameters.
+        epochs, batch_size, lr, weight_decay: Training hyperparameters
+            (epochs is the upper cap when early stopping is on).
         balance_classes: If True (default), weight the loss by inverse class
             frequency to mirror the tree models' class_weight='balanced'.
         random_state: Seed for reproducibility.
@@ -136,6 +143,7 @@ def fit_mlp(x_train, y_train, groups=None, val_fraction=0.2, hidden_dims=(128, 6
 
     history = {'train': [], 'val': ([] if val_loader is not None else None),
                'xlabel': 'Epoch', 'ylabel': 'Loss'}
+    best_val, best_state, best_epoch, epochs_no_improve = float('inf'), None, -1, 0
 
     start_time = time.perf_counter()
     for epoch in range(epochs):
@@ -157,17 +165,37 @@ def fit_mlp(x_train, y_train, groups=None, val_fraction=0.2, hidden_dims=(128, 6
                 for xb, yb in val_loader:
                     xb, yb = xb.to(device), yb.to(device)
                     val_running += criterion(model(xb), yb).item() * len(xb)
-            history['val'].append(val_running / len(val_ds))
+            val_loss = val_running / len(val_ds)
+            history['val'].append(val_loss)
+
+            if early_stopping_rounds is not None:
+                if val_loss < best_val - 1e-6:
+                    best_val, best_epoch, epochs_no_improve = val_loss, epoch, 0
+                    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                else:
+                    epochs_no_improve += 1
 
         if verbose and (epoch + 1) % 10 == 0:
             msg = f"epoch {epoch + 1}/{epochs}  train {history['train'][-1]:.4f}"
             if val_loader is not None:
                 msg += f"  val {history['val'][-1]:.4f}"
             print(msg)
+
+        if (early_stopping_rounds is not None and val_loader is not None
+                and epochs_no_improve >= early_stopping_rounds):
+            if verbose:
+                print(f'early stopping at epoch {epoch + 1}; '
+                      f'best epoch {best_epoch + 1} (val {best_val:.4f})')
+            break
     train_time = time.perf_counter() - start_time
 
-    # Move to CPU so the wrapper pickles/loads regardless of MPS availability.
+    # Move to CPU so the wrapper pickles/loads regardless of MPS availability,
+    # then restore the best-epoch weights if early stopping was used.
     model.to('cpu').eval()
+    if early_stopping_rounds is not None and best_state is not None:
+        model.load_state_dict(best_state)
+
     clf = _MLPClassifier(model, label_encoder, scaler, label_encoder.classes_)
     clf.history_ = history
+    clf.best_epoch_ = best_epoch if (early_stopping_rounds is not None and best_epoch >= 0) else None
     return clf, train_time

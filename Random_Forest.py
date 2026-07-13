@@ -17,14 +17,19 @@ RF_PARAM_DISTRIBUTIONS = {
     'max_features': ['sqrt', 'log2', 0.5],
 }
 
+# n_estimators is intentionally absent: tune_xgboost fixes it high and lets early
+# stopping choose the effective number of rounds. gamma (min split loss), reg_alpha
+# (L1), and max_delta_step (helps imbalanced classes) are added regularizers.
 XGB_PARAM_DISTRIBUTIONS = {
-    'n_estimators': [200, 400, 600],
     'max_depth': [3, 4, 6, 8, 10],
     'learning_rate': [0.01, 0.03, 0.05, 0.1, 0.2],
     'subsample': [0.6, 0.8, 1.0],
     'colsample_bytree': [0.6, 0.8, 1.0],
     'min_child_weight': [1, 3, 5],
     'reg_lambda': [0.5, 1, 2, 5],
+    'gamma': [0, 0.5, 1, 2, 5],
+    'reg_alpha': [0, 0.5, 1, 2],
+    'max_delta_step': [0, 1, 3, 5],
 }
 
 def fit_random_forest(x_train, y_train, **kwargs):
@@ -82,7 +87,8 @@ class _LabelDecodingClassifier:
         return getattr(self.model, name)
 
 
-def fit_xgboost(x_train, y_train, groups=None, val_fraction=0.2, balance_classes=True, **kwargs):
+def fit_xgboost(x_train, y_train, groups=None, val_fraction=0.2, balance_classes=True,
+                early_stopping_rounds=None, **kwargs):
     """Fit an XGBoost classifier on the training data.
 
     Kept separate from fit_random_forest so the plain RandomForest path still
@@ -101,6 +107,10 @@ def fit_xgboost(x_train, y_train, groups=None, val_fraction=0.2, balance_classes
         balance_classes: If True (default), pass per-sample 'balanced' weights
             to mirror RandomForest's class_weight='balanced' (XGBoost has no
             class_weight for multiclass).
+        early_stopping_rounds: If set (and groups is provided), stop boosting when
+            validation mlogloss hasn't improved for this many rounds and predict
+            with best_iteration. Requires the grouped val split, so it is ignored
+            when groups is None. The plain XGBoost model leaves this None.
         **kwargs: Additional keyword arguments passed to XGBClassifier
             (e.g. n_estimators, max_depth, learning_rate), overriding defaults.
 
@@ -127,6 +137,11 @@ def fit_xgboost(x_train, y_train, groups=None, val_fraction=0.2, balance_classes
     else:
         x_fit, y_fit = x_train, y_encoded
         eval_set = None
+
+    # Early stopping needs a validation set; it watches the last eval_set entry
+    # (validation_1 = the held-out val split).
+    if early_stopping_rounds is not None and eval_set is not None:
+        params['early_stopping_rounds'] = early_stopping_rounds
 
     sample_weight = compute_sample_weight('balanced', y_fit) if balance_classes else None
 
@@ -190,21 +205,30 @@ def tune_random_forest(x_train, y_train, groups, param_distributions=None, n_ite
 
 
 def tune_xgboost(x_train, y_train, groups, param_distributions=None, n_iter=20,
-                 n_splits=4, scoring='f1_macro', random_state=1234, n_jobs=-1):
-    """Grouped-CV randomized hyperparameter search for XGBoost.
+                 n_splits=4, scoring='f1_macro', random_state=1234, n_jobs=-1,
+                 early_stopping_rounds=50, n_estimators=2000, search_n_estimators=400):
+    """Grouped-CV randomized hyperparameter search for XGBoost, with early stopping.
 
     The search runs on label-encoded targets (XGBoost requires a contiguous
-    0..k-1 range) with StratifiedGroupKFold and macro-F1 selection. The winning
-    params are then refit on the full training set via fit_xgboost, so the final
-    model is class-balanced, label-decoding, and picklable exactly like the
-    plain XGBoost model.
+    0..k-1 range) with StratifiedGroupKFold and macro-F1 selection, using a fixed
+    moderate number of trees (search_n_estimators) to choose the other
+    hyperparameters (depth, learning_rate, subsample, gamma, reg_alpha,
+    max_delta_step, ...). The winning params are then refit via fit_xgboost with
+    a high n_estimators cap and early stopping on a grouped hold-out split, so the
+    number of boosting rounds is chosen by validation mlogloss rather than tuned.
+    The final model is class-balanced, label-decoding, and picklable like the
+    plain XGBoost model, and carries a train/val loss curve on .history_.
 
     Args:
         x_train, y_train: Training predictors and labels (original GLanCE IDs).
         groups: Group labels (Glance_ID) aligned row-for-row with x_train.
         param_distributions: Dict of param -> list to sample from
-            (defaults to XGB_PARAM_DISTRIBUTIONS).
+            (defaults to XGB_PARAM_DISTRIBUTIONS; note n_estimators is not tuned).
         n_iter, n_splits, scoring, random_state, n_jobs: As in tune_random_forest.
+        early_stopping_rounds: Patience for early stopping at the final refit.
+        n_estimators: Upper cap on boosting rounds for the final model (early
+            stopping picks the effective count).
+        search_n_estimators: Fixed number of trees used during the CV search.
 
     Returns:
         Tuple of (best fitted classifier whose predict() returns original labels,
@@ -219,8 +243,9 @@ def tune_xgboost(x_train, y_train, groups, param_distributions=None, n_iter=20,
     y_encoded = label_encoder.fit_transform(y_train)
 
     # n_jobs=1 on the estimator so the search parallelizes over folds instead of
-    # each booster grabbing every core (avoids oversubscription).
-    base = XGBClassifier(random_state=random_state, n_jobs=1)
+    # each booster grabbing every core (avoids oversubscription). n_estimators is
+    # fixed here (not tuned); early stopping sets it for the final model.
+    base = XGBClassifier(random_state=random_state, n_jobs=1, n_estimators=search_n_estimators)
     cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     search = RandomizedSearchCV(
         base, param_distributions, n_iter=n_iter, scoring=scoring, cv=cv,
@@ -230,9 +255,12 @@ def tune_xgboost(x_train, y_train, groups, param_distributions=None, n_iter=20,
     start_time = time.perf_counter()
     search.fit(x_train, y_encoded, groups=groups)
 
-    # Refit the winning params with class balancing; pass groups so the tuned
-    # model also gets a train/val boosting-round curve on its .history_.
-    best_model, _ = fit_xgboost(x_train, y_train, groups=groups, **search.best_params_)
+    # Refit the winning params with class balancing + early stopping; pass groups
+    # so the tuned model gets its train/val boosting-round curve and stops when
+    # validation mlogloss plateaus (up to the n_estimators cap).
+    best_model, _ = fit_xgboost(
+        x_train, y_train, groups=groups, early_stopping_rounds=early_stopping_rounds,
+        n_estimators=n_estimators, **search.best_params_)
     total_time = time.perf_counter() - start_time
 
     return best_model, total_time, search.best_params_

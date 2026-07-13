@@ -84,9 +84,9 @@ class _CNNClassifier:
         return e / e.sum(axis=1, keepdims=True)
 
 
-def fit_cnn(x_train, y_train, groups=None, val_fraction=0.2, dropout=0.3, epochs=40,
-            batch_size=128, lr=1e-3, weight_decay=0.0, balance_classes=True,
-            random_state=1234, device=None, verbose=False):
+def fit_cnn(x_train, y_train, groups=None, val_fraction=0.2, early_stopping_rounds=None,
+            dropout=0.3, epochs=40, batch_size=128, lr=1e-3, weight_decay=0.0,
+            balance_classes=True, random_state=1234, device=None, verbose=False):
     """Train a small CNN on embedding patches.
 
     Args:
@@ -94,7 +94,16 @@ def fit_cnn(x_train, y_train, groups=None, val_fraction=0.2, dropout=0.3, epochs
             align_patch_arrays). Rows that are all-NaN (patch missing) are
             dropped from training.
         y_train: Labels (original GLanCE IDs), aligned to x_train rows.
-        dropout, epochs, batch_size, lr, weight_decay: Training hyperparameters.
+        groups, val_fraction: Optional Glance_ID groups + hold-out fraction for a
+            grouped validation split (records train/val loss per epoch on
+            .history_). If groups is None, trains on all rows and there is no val.
+        early_stopping_rounds: If set (and groups is provided), stop when the
+            validation loss hasn't improved for this many epochs and restore the
+            best-epoch weights; the chosen epoch is stored on .best_epoch_.
+            Requires the grouped val split, so it is ignored when groups is None.
+            The plain CNN leaves this None (trains the full `epochs`).
+        dropout, epochs, batch_size, lr, weight_decay: Training hyperparameters
+            (epochs is the upper cap when early stopping is on).
         balance_classes: If True (default), weight the loss by inverse class
             frequency, mirroring the other variants' balancing.
         random_state, device, verbose: As in fit_mlp.
@@ -166,6 +175,7 @@ def fit_cnn(x_train, y_train, groups=None, val_fraction=0.2, dropout=0.3, epochs
 
     history = {'train': [], 'val': ([] if val_loader is not None else None),
                'xlabel': 'Epoch', 'ylabel': 'Loss'}
+    best_val, best_state, best_epoch, epochs_no_improve = float('inf'), None, -1, 0
 
     start_time = time.perf_counter()
     for epoch in range(epochs):
@@ -187,16 +197,36 @@ def fit_cnn(x_train, y_train, groups=None, val_fraction=0.2, dropout=0.3, epochs
                 for xb, yb in val_loader:
                     xb, yb = xb.to(device), yb.to(device)
                     val_running += criterion(model(xb), yb).item() * len(xb)
-            history['val'].append(val_running / len(val_ds))
+            val_loss = val_running / len(val_ds)
+            history['val'].append(val_loss)
+
+            if early_stopping_rounds is not None:
+                if val_loss < best_val - 1e-6:
+                    best_val, best_epoch, epochs_no_improve = val_loss, epoch, 0
+                    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                else:
+                    epochs_no_improve += 1
 
         if verbose and (epoch + 1) % 10 == 0:
             msg = f"epoch {epoch + 1}/{epochs}  train {history['train'][-1]:.4f}"
             if val_loader is not None:
                 msg += f"  val {history['val'][-1]:.4f}"
             print(msg)
+
+        if (early_stopping_rounds is not None and val_loader is not None
+                and epochs_no_improve >= early_stopping_rounds):
+            if verbose:
+                print(f'early stopping at epoch {epoch + 1}; '
+                      f'best epoch {best_epoch + 1} (val {best_val:.4f})')
+            break
     train_time = time.perf_counter() - start_time
 
+    # Move to CPU (device-agnostic pickling), then restore best-epoch weights.
     model.to('cpu').eval()
+    if early_stopping_rounds is not None and best_state is not None:
+        model.load_state_dict(best_state)
+
     clf = _CNNClassifier(model, label_encoder, scaler, label_encoder.classes_)
     clf.history_ = history
+    clf.best_epoch_ = best_epoch if (early_stopping_rounds is not None and best_epoch >= 0) else None
     return clf, train_time
