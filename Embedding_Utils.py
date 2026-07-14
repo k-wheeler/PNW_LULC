@@ -180,3 +180,23 @@ def align_patch_arrays(patches, keys, target_key_df):
         if idx is not None:
             out[row] = patches[idx]
     return out
+
+
+def neighborhood_stats(patches):
+    """Per-band neighborhood mean and std over each k x k window.
+
+    Turns patch windows (n, k, k, 64) into tabular spatial-context features for a
+    tree model: the mean captures local average, the std captures texture /
+    heterogeneity. Masked pixels within a window are ignored (nan-aware); a
+    fully-missing window yields NaN (which XGBoost handles natively).
+
+    Returns:
+        DataFrame (n, 128) with columns A00_mean..A63_mean, A00_std..A63_std.
+    """
+    n, _, _, channels = patches.shape
+    flat = patches.reshape(n, -1, channels)  # (n, k*k, channels)
+    with np.errstate(invalid='ignore'):  # all-NaN window -> NaN, no warning spam
+        means = np.nanmean(flat, axis=1)
+        stds = np.nanstd(flat, axis=1)
+    columns = [f'{b}_mean' for b in EMBEDDING_BANDS] + [f'{b}_std' for b in EMBEDDING_BANDS]
+    return pd.DataFrame(np.hstack([means, stds]), columns=columns)
