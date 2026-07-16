@@ -16,6 +16,7 @@ from sklearn.metrics import (
     ConfusionMatrixDisplay,
     f1_score,
     matthews_corrcoef,
+    recall_score,
 )
 
 
@@ -128,8 +129,37 @@ def evaluate_model(model, x_test, y_test, class_map=None, normalize='true',
     }
 
 
+def _mark_top_two(values, digits=4):
+    """Format scores as strings, marking the best with '*' and the runner-up with '**'.
+
+    Ranks by *distinct* value, so models tied for best all get '*' and the runner-up mark
+    goes to the next distinct score down (not to a model tied for first). If every model
+    scores the same there is no runner-up and nothing gets '**'.
+
+    Args:
+        values: 1-D sequence of scores (higher is better).
+        digits: Decimal places to format each score to.
+
+    Returns:
+        List of formatted strings, in the same order as values.
+    """
+    ranked = sorted(pd.unique(np.asarray(values)), reverse=True)
+    best = ranked[0] if len(ranked) > 0 else None
+    second = ranked[1] if len(ranked) > 1 else None
+
+    out = []
+    for v in values:
+        text = f'{v:.{digits}f}'
+        if best is not None and v == best:
+            text += '*'
+        elif second is not None and v == second:
+            text += '**'
+        out.append(text)
+    return out
+
+
 def compare_models(models, x_test, y_test, class_map=None, save_dir=None,
-                   prefix='model_comparison'):
+                   prefix='model_comparison', subset_classes=None):
     """Compare several fitted models on one held-out set: build summary tables and
     comparison figures side by side.
 
@@ -143,14 +173,35 @@ def compare_models(models, x_test, y_test, class_map=None, save_dir=None,
         class_map: Optional dict mapping class label -> readable name.
         save_dir: If given, save the summary CSV and figures here.
         prefix: Filename prefix for saved outputs.
+        subset_classes: Optional list of class labels (e.g. class1_subset /
+            class2_subset from Glance_Class_Definitions). If given, adds a
+            'Subset balanced accuracy' column: the average of per-class recall over
+            these classes only. Requested classes with no true samples in y_test have
+            undefined recall and are dropped from the average (rather than counted as
+            0, which would understate the score); a note is printed when that happens.
 
     Returns:
-        Tuple of (summary_df, per_class_f1_df).
+        Tuple of (summary_df, per_class_f1_df), each formatted as strings with "*"
+        marking the best value and "**" the runner-up (see _mark_top_two):
           summary_df:      one row per model, headline metrics + training time.
-          per_class_f1_df: per-class F1 (rows = classes, cols = models).
+                           Marked down each metric column (all but Training time,
+                           where lower is better and nothing is marked).
+          per_class_f1_df: per-class F1 (rows = classes, cols = models). Marked
+                           across each row, i.e. per class.
     """
     labels = np.unique(np.asarray(y_test))
     class_names = [str(class_map[l]) for l in labels] if class_map is not None else [str(l) for l in labels]
+
+    # Recall is undefined for a requested subset class with no true samples, so average
+    # only over the ones actually present in y_test.
+    subset_labels = None
+    if subset_classes is not None:
+        subset_labels = [c for c in subset_classes if c in set(labels)]
+        missing = [c for c in subset_classes if c not in set(labels)]
+        if missing:
+            missing_names = [str(class_map[c]) if class_map is not None else str(c) for c in missing]
+            print(f'Subset balanced accuracy: no test samples for {", ".join(missing_names)} '
+                  f'-- averaging over the remaining {len(subset_labels)} subset class(es).')
 
     summary = {}
     per_class = {}
@@ -160,21 +211,30 @@ def compare_models(models, x_test, y_test, class_map=None, save_dir=None,
         model, train_time = spec[0], spec[1]
         x_eval = spec[2] if len(spec) > 2 else x_test
         y_pred = model.predict(x_eval)
-        summary[name] = {
+        row = {
             'Accuracy': accuracy_score(y_test, y_pred),
             'Balanced accuracy': balanced_accuracy_score(y_test, y_pred),
+        }
+        if subset_labels:
+            # Balanced accuracy is the macro average of recall, so restricting the labels
+            # gives the same metric computed over the subset classes only.
+            row['Subset balanced accuracy'] = recall_score(
+                y_test, y_pred, labels=subset_labels, average='macro', zero_division=0)
+        row.update({
             'Macro F1': f1_score(y_test, y_pred, labels=labels, average='macro', zero_division=0),
             'Weighted F1': f1_score(y_test, y_pred, labels=labels, average='weighted', zero_division=0),
             "Cohen's kappa": cohen_kappa_score(y_test, y_pred),
             'MCC': matthews_corrcoef(y_test, y_pred),
             'Training time (s)': train_time,
-        }
+        })
+        summary[name] = row
         per_class[name] = f1_score(y_test, y_pred, labels=labels, average=None, zero_division=0)
 
     summary_df = pd.DataFrame(summary).T
     per_class_f1_df = pd.DataFrame(per_class, index=class_names)
 
-    metric_cols = ['Accuracy', 'Balanced accuracy', 'Macro F1', 'Weighted F1']
+    metric_cols = [c for c in ['Accuracy', 'Balanced accuracy', 'Subset balanced accuracy',
+                               'Macro F1', 'Weighted F1'] if c in summary_df.columns]
 
     # ── Figure 1: headline metrics (grouped bars) + training time (own axis) ──
     fig, (ax_m, ax_t) = plt.subplots(1, 2, figsize=(14, 5),
@@ -213,13 +273,55 @@ def compare_models(models, x_test, y_test, class_map=None, save_dir=None,
     fig_h.colorbar(im, ax=ax_h, fraction=0.046, pad=0.04, label='F1')
     fig_h.tight_layout()
 
+    # ── Mark best ("*") and runner-up ("**") per column (summary) / per row (per-class F1) ──
+    # Training time is excluded from the marking: lower, not higher, is better.
+    higher_is_better_cols = [c for c in summary_df.columns if c != 'Training time (s)']
+    summary_display = summary_df.copy().astype(object)
+    for col in summary_df.columns:
+        if col in higher_is_better_cols:
+            summary_display[col] = _mark_top_two(summary_df[col].values)
+        else:
+            summary_display[col] = [f'{v:.2f}' for v in summary_df[col].values]
+
+    per_class_f1_display = per_class_f1_df.copy().astype(object)
+    for idx in per_class_f1_df.index:
+        per_class_f1_display.loc[idx] = _mark_top_two(per_class_f1_df.loc[idx].values)
+
     if save_dir is not None:
-        summary_df.to_csv(f'{save_dir}/{prefix}_summary.csv')
-        per_class_f1_df.to_csv(f'{save_dir}/{prefix}_per_class_f1.csv')
+        summary_display.to_csv(f'{save_dir}/{prefix}_summary.csv')
+        per_class_f1_display.to_csv(f'{save_dir}/{prefix}_per_class_f1.csv')
         fig.savefig(f'{save_dir}/{prefix}_metrics.png', bbox_inches='tight', dpi=150)
         fig_h.savefig(f'{save_dir}/{prefix}_per_class_f1.png', bbox_inches='tight', dpi=150)
 
-    return summary_df, per_class_f1_df
+    return summary_display, per_class_f1_display
+
+
+def class_count_table(id_series, class_dict, state_of):
+    """Formatted class-count table: Full dataset / Washington / Oregon / WA + OR + Total.
+
+    Args:
+        id_series: Series of readable class names (e.g. a Glance_Class_ID column already
+            mapped through class_dict), one row per observation.
+        class_dict: Dict mapping class id -> readable name, used only to order the rows.
+        state_of: Series of 'Washington' / 'Oregon' / NaN, aligned to id_series' index
+            (e.g. from Geo_Utils.assign_wa_or_state).
+
+    Returns:
+        DataFrame of "count (pct%)" strings, rows = class names + Total, columns =
+        Full dataset / Washington / Oregon / WA + OR.
+    """
+    class_order = [class_dict[k] for k in sorted(class_dict)]
+    counts = pd.DataFrame({
+        'Full dataset': id_series.value_counts(),
+        'Washington': id_series[state_of == 'Washington'].value_counts(),
+        'Oregon': id_series[state_of == 'Oregon'].value_counts(),
+    }).reindex(class_order).fillna(0).astype(int)
+    counts['WA + OR'] = counts['Washington'] + counts['Oregon']
+    counts.loc['Total'] = counts.sum()
+
+    col_totals = counts.loc['Total']
+    return counts.apply(lambda col: col.map(
+        lambda v: f'{v:,} ({v / col_totals[col.name] * 100:.1f}%)' if col_totals[col.name] else f'{v:,}'))
 
 
 def plot_training_curve(history, title='Training curve', ax=None, save_path=None):
