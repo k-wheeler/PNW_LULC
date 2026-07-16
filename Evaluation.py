@@ -12,8 +12,10 @@ from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
     classification_report,
+    cohen_kappa_score,
     ConfusionMatrixDisplay,
     f1_score,
+    matthews_corrcoef,
 )
 
 
@@ -90,12 +92,18 @@ def evaluate_model(model, x_test, y_test, class_map=None, normalize='true',
     accuracy = accuracy_score(y_test, y_pred)
     balanced_accuracy = balanced_accuracy_score(y_test, y_pred)
     macro_f1 = f1_score(y_test, y_pred, labels=labels, average='macro')
+    # Chance-corrected agreement (kappa) and a balanced multiclass correlation
+    # (MCC): both max at 1, and both stay honest under class imbalance.
+    kappa = cohen_kappa_score(y_test, y_pred)
+    mcc = matthews_corrcoef(y_test, y_pred)
 
     print(classification_report(y_test, y_pred, labels=labels,
                                 target_names=target_names, digits=digits, zero_division=0))
     print(f'Overall accuracy : {accuracy:.{digits}f}')
     print(f'Balanced accuracy: {balanced_accuracy:.{digits}f}')
     print(f'Macro F1         : {macro_f1:.{digits}f}')
+    print(f"Cohen's kappa    : {kappa:.{digits}f}")
+    print(f'MCC              : {mcc:.{digits}f}')
 
     if ax is None:
         _, ax = plt.subplots(figsize=(8, 7))
@@ -114,6 +122,8 @@ def evaluate_model(model, x_test, y_test, class_map=None, normalize='true',
         'accuracy': accuracy,
         'balanced_accuracy': balanced_accuracy,
         'macro_f1': macro_f1,
+        'cohen_kappa': kappa,
+        'mcc': mcc,
         'y_pred': y_pred,
     }
 
@@ -155,6 +165,8 @@ def compare_models(models, x_test, y_test, class_map=None, save_dir=None,
             'Balanced accuracy': balanced_accuracy_score(y_test, y_pred),
             'Macro F1': f1_score(y_test, y_pred, labels=labels, average='macro', zero_division=0),
             'Weighted F1': f1_score(y_test, y_pred, labels=labels, average='weighted', zero_division=0),
+            "Cohen's kappa": cohen_kappa_score(y_test, y_pred),
+            'MCC': matthews_corrcoef(y_test, y_pred),
             'Training time (s)': train_time,
         }
         per_class[name] = f1_score(y_test, y_pred, labels=labels, average=None, zero_division=0)
