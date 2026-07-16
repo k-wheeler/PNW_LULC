@@ -1,17 +1,44 @@
-"""Washington/Oregon geometry helpers shared by the Class Distribution and Model
-Comparison (WA/OR subset) cells for both the Level-1 and Level-2 sections of Main.ipynb.
+"""Washington/Oregon geometry helpers.
+
+Used by the Class Distribution and Model Comparison (WA/OR subset) cells for both the
+Level-1 and Level-2 sections of Main.ipynb, and by Map_Export.py to build the
+wall-to-wall export AOI.
 """
 
 import ee
 import geopandas as gpd
 
+STATES_COLLECTION_ID = 'TIGER/2018/States'
+STATE_NAMES = ['Washington', 'Oregon']
+
+
+def _wa_or_fc():
+    """The two states as an Earth Engine FeatureCollection."""
+    return (ee.FeatureCollection(STATES_COLLECTION_ID)
+            .filter(ee.Filter.inList('NAME', STATE_NAMES)))
+
 
 def get_wa_or_states():
-    """Washington + Oregon polygons from TIGER 2018 state boundaries."""
-    wa_or_fc = (ee.FeatureCollection('TIGER/2018/States')
-                .filter(ee.Filter.inList('NAME', ['Washington', 'Oregon'])))
+    """Washington + Oregon polygons from TIGER 2018 state boundaries.
+
+    Pulls the geometry client-side (one getInfo) for point-in-polygon work; see
+    get_wa_or_geometry() for the server-side counterpart.
+    """
     return gpd.GeoDataFrame.from_features(
-        wa_or_fc.getInfo()['features'], crs='EPSG:4326')[['NAME', 'geometry']]
+        _wa_or_fc().getInfo()['features'], crs='EPSG:4326')[['NAME', 'geometry']]
+
+
+def get_wa_or_geometry(max_error=100):
+    """Washington + Oregon dissolved into a single server-side ee.Geometry.
+
+    The Earth Engine counterpart to get_wa_or_states(): it stays server-side, so it can be
+    used directly as an Export region / intersection geometry without pulling the (large)
+    state polygons down to the client.
+
+    Args:
+        max_error: Maximum reprojection error in metres allowed by dissolve().
+    """
+    return _wa_or_fc().geometry().dissolve(maxError=max_error)
 
 
 def assign_wa_or_state(expanded_df, wa_or_states):
