@@ -1,0 +1,12 @@
+# Inference dependencies for vm_predict.py, PINNED to the versions the model was trained
+# and pickled with (measured in the local `gee` conda env). The saved model is a pickle:
+# a different xgboost/scikit-learn build can fail to load or -- worse -- load and predict
+# differently. Do not float these versions without re-validating local == container output.
+xgboost==3.2.0
+scikit-learn==1.9.0
+numpy==1.26.4
+scipy==1.17.1
+joblib==1.5.3
+pandas==3.0.3
+rasterio==1.4.4
+google-cloud-storage==3.12.0

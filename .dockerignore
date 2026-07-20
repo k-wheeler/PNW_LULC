@@ -1,0 +1,18 @@
+# Keep the build context tiny. The Dockerfile COPYs exactly what it needs by name; without
+# this, `docker build` would upload the whole ~3 GB repo (Data/ + Model_Outputs/) as context.
+
+# Large data + model outputs -- the one model file we need is COPYed explicitly by the Dockerfile.
+Data/
+Model_Outputs/*
+!Model_Outputs/XGBoost_tuned_model_groupedCV.joblib
+
+# Notebooks, git, caches, envs -- none belong in an inference image.
+*.ipynb
+.ipynb_checkpoints/
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.DS_Store
+scratchpad/
+*.md

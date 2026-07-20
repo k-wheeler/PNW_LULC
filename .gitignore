@@ -1,0 +1,27 @@
+# Large data / model outputs -- not meant for git, regenerated or fetched locally.
+# (Neither has ever been tracked, but nothing was previously stopping `git add -A`
+# from sweeping in ~3 GB of GLanCE data + trained models.)
+Data/
+Model_Outputs/
+CCDC_Outputs/
+
+# Credentials. Blanket *.json is deliberate: a future `gcloud iam service-accounts
+# keys create` can name its output file anything, so a name-pattern guess (e.g.
+# *service-account*.json) is not reliable protection. No other *.json is currently
+# tracked or needed in this repo -- if one legitimately needs to be committed later,
+# add a `!path/to/file.json` line to re-include it explicitly.
+*.json
+*.pem
+*.key
+.env
+
+# Local tool config -- machine-specific, not shared project state.
+.claude/
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Docker build artifacts (none currently produced locally, but keep tarballs out
+# if `docker save` is ever used instead of pushing to Artifact Registry).
+*.tar
