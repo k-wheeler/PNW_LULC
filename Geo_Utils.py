@@ -11,11 +11,14 @@ import geopandas as gpd
 STATES_COLLECTION_ID = 'TIGER/2018/States'
 STATE_NAMES = ['Washington', 'Oregon']
 
+COUNTIES_COLLECTION_ID = 'TIGER/2018/Counties'
+STATE_FIPS = ['41', '53']  # Oregon = 41, Washington = 53
 
-def _wa_or_fc():
-    """The two states as an Earth Engine FeatureCollection."""
+
+def _wa_or_fc(state_names=STATE_NAMES):
+    """One or both states as an Earth Engine FeatureCollection."""
     return (ee.FeatureCollection(STATES_COLLECTION_ID)
-            .filter(ee.Filter.inList('NAME', STATE_NAMES)))
+            .filter(ee.Filter.inList('NAME', list(state_names))))
 
 
 def get_wa_or_states():
@@ -28,17 +31,43 @@ def get_wa_or_states():
         _wa_or_fc().getInfo()['features'], crs='EPSG:4326')[['NAME', 'geometry']]
 
 
-def get_wa_or_geometry(max_error=100):
-    """Washington + Oregon dissolved into a single server-side ee.Geometry.
+def get_counties(state_fps=STATE_FIPS, names=None):
+    """OR/WA counties from TIGER 2018 as a GeoDataFrame (EPSG:4326).
+
+    Used to attribute change/carbon to a reporting county (the pilot uses Lane + Linn; the
+    full carbon run uses all OR+WA counties).
+
+    Args:
+        state_fps: State FIPS codes to include (default Oregon 41 + Washington 53).
+        names: Optional list of county NAMEs to restrict to (e.g. ['Lane', 'Linn']).
+
+    Returns:
+        GeoDataFrame with NAME, STATEFP, GEOID, geometry. **Key on GEOID, not NAME** -- county
+        names are not unique across OR+WA (both states have a Columbia and a Lincoln county);
+        GEOID (state+county FIPS) is the unique identifier.
+    """
+    filt = ee.Filter.inList('STATEFP', list(state_fps))
+    if names is not None:
+        filt = ee.Filter.And(filt, ee.Filter.inList('NAME', list(names)))
+    fc = ee.FeatureCollection(COUNTIES_COLLECTION_ID).filter(filt)
+    gdf = gpd.GeoDataFrame.from_features(fc.getInfo()['features'], crs='EPSG:4326')
+    return gdf[['NAME', 'STATEFP', 'GEOID', 'geometry']]
+
+
+def get_wa_or_geometry(max_error=100, state_names=STATE_NAMES):
+    """One or both states dissolved into a single server-side ee.Geometry.
 
     The Earth Engine counterpart to get_wa_or_states(): it stays server-side, so it can be
     used directly as an Export region / intersection geometry without pulling the (large)
-    state polygons down to the client.
+    state polygons down to the client. Defaults to Washington + Oregon; pass
+    state_names=['Oregon'] to restrict to a single state (e.g. for an Oregon-only wall-to-wall
+    run -- see Map_Export.get_forest_aoi).
 
     Args:
         max_error: Maximum reprojection error in metres allowed by dissolve().
+        state_names: State NAMEs to include (default both WA + OR).
     """
-    return _wa_or_fc().geometry().dissolve(maxError=max_error)
+    return _wa_or_fc(state_names).geometry().dissolve(maxError=max_error)
 
 
 def assign_wa_or_state(expanded_df, wa_or_states):

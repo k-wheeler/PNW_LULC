@@ -12,9 +12,10 @@ import ee
 import pandas as pd
 
 from Embedding_Utils import EMBEDDING_BANDS, EMBEDDING_COLLECTION_ID
-from Geo_Utils import get_wa_or_geometry
+from Geo_Utils import STATE_NAMES, get_wa_or_geometry
 
 ECOREGIONS_COLLECTION_ID = 'RESOLVE/ECOREGIONS/2017'
+GLIMS_COLLECTION_ID = 'GLIMS/current'  # global glacier-outline snapshot; filterBounds to the AOI
 
 # Hand-picked ecoregions defining the mapped AOI within WA+OR. Transcribed from the dataset
 # itself (see list_ecoregions()), not from memory -- ECO_NAME capitalisation is
@@ -76,21 +77,61 @@ def list_ecoregions(geometry=None):
     return df
 
 
-def get_forest_aoi(max_error=100):
-    """The forest AOI: FOREST_ECOREGIONS clipped to the WA+OR boundary.
+def get_forest_ecoregion_fc():
+    """FOREST_ECOREGIONS as an ee.FeatureCollection, one feature per ecoregion polygon.
+
+    The individual polygons, before they are dissolved into the single AOI geometry --
+    useful for mapping each ecoregion separately (e.g. colouring by ECO_NAME).
+    """
+    return (ee.FeatureCollection(ECOREGIONS_COLLECTION_ID)
+            .filter(ee.Filter.inList('ECO_NAME', FOREST_ECOREGIONS)))
+
+
+def get_glacier_fc(bounds):
+    """GLIMS glacier outlines intersecting `bounds`, as an ee.FeatureCollection.
+
+    GLIMS/current is a global snapshot (~787k features worldwide), so this always
+    filterBounds's first -- never touch the whole collection. It is a fixed snapshot and PNW
+    glaciers have retreated since capture, so painting it as a mask slightly over-covers
+    current ice extent. That is the safe direction: it drops a few real forest-edge pixels
+    rather than keeps misclassified ice, and it is tiny relative to the AOI (measured ~4,278
+    ha inside the Oregon forest AOI; ~92,000 ha across WA+OR).
+
+    Returned as a FeatureCollection (not a dissolved geometry) on purpose: painting the ~1000
+    Oregon polygons straight into the mask is far cheaper than dissolving them, and glacier
+    polygons do not overlap so nothing is double-counted.
+
+    Args:
+        bounds: ee.Geometry to filter glacier polygons to (e.g. the forest AOI).
+    """
+    return ee.FeatureCollection(GLIMS_COLLECTION_ID).filterBounds(bounds)
+
+
+def get_forest_aoi(max_error=100, state_names=STATE_NAMES, exclude_glaciers=True):
+    """The forest AOI: FOREST_ECOREGIONS clipped to the state boundary, glaciers excluded.
 
     Args:
         max_error: Maximum reprojection error in metres for dissolve/intersection.
+        state_names: States to clip to (default Washington + Oregon). Pass ['Oregon'] to
+            restrict a run to Oregon only -- FOREST_ECOREGIONS itself is unchanged (some
+            entries, e.g. Puget lowland forests, then simply contribute zero area).
+        exclude_glaciers: Subtract GLIMS glacier outlines from the mask. The trained model
+            has no Ice/Snow class (GLanCE's North America training data contains none -- see
+            the plan's "known model limitation"), so every glaciated pixel would otherwise be
+            silently misclassified as Trees/Barren/Shrubs.
 
     Returns:
         Tuple of (geometry, mask):
-          geometry: ee.Geometry of forest ecoregions within WA+OR -- the Export region.
-          mask:     ee.Image that is 1 over those ecoregions and masked elsewhere, so
-                    updateMask() drops non-forest pixels rather than classifying them.
+          geometry: ee.Geometry of forest ecoregions within the state(s) -- the Export region.
+                    Not itself differenced against glaciers (that is a small, scattered set of
+                    holes -- cheaper and equally correct to drop via the mask below); the
+                    exported/predicted pixels are what must exclude ice, and they do.
+          mask:     ee.Image that is 1 over forest and (if exclude_glaciers) not glacier,
+                    masked elsewhere, so updateMask() drops non-forest and glacier pixels
+                    rather than classifying them.
     """
-    states = get_wa_or_geometry(max_error=max_error)
-    forest_fc = (ee.FeatureCollection(ECOREGIONS_COLLECTION_ID)
-                 .filter(ee.Filter.inList('ECO_NAME', FOREST_ECOREGIONS)))
+    states = get_wa_or_geometry(max_error=max_error, state_names=state_names)
+    forest_fc = get_forest_ecoregion_fc()
 
     geometry = (forest_fc.geometry()
                 .dissolve(maxError=max_error)
@@ -98,6 +139,11 @@ def get_forest_aoi(max_error=100):
     # Painting the FeatureCollection is cheaper than clipping to the dissolved polygon;
     # pixels outside the painted features stay masked, which is what updateMask wants.
     mask = ee.Image().byte().paint(forest_fc, 1).gt(0)
+
+    if exclude_glaciers:
+        glacier_paint = ee.Image().byte().paint(get_glacier_fc(geometry), 1)
+        mask = mask.where(glacier_paint, 0)
+
     return geometry, mask
 
 
@@ -122,12 +168,13 @@ def get_embedding_image(year, mask=None):
 
 def export_embeddings_to_gcs(year, geometry, mask, bucket, prefix='embeddings',
                              scale=10, crs='EPSG:5070', file_dimensions=1024,
-                             max_pixels=1e13):
-    """Submit a Cloud Storage export of one year's forest-masked embeddings.
+                             max_pixels=1e13, description=None):
+    """Submit a Cloud Storage export of one year's masked embeddings.
 
     Args:
         year: Year to export.
-        geometry, mask: From get_forest_aoi().
+        geometry, mask: An export region + updateMask image. From get_forest_aoi() for the
+            full run, or a fire perimeter for the pilot -- any geometry/mask pair works.
         bucket: GCS bucket name (no gs:// prefix).
         prefix: Object-name prefix; tiles land at {prefix}/{year}/embeddings_{year}*.tif.
         scale: Metres per pixel (10 = AlphaEarth's native resolution).
@@ -136,7 +183,9 @@ def export_embeddings_to_gcs(year, geometry, mask, bucket, prefix='embeddings',
         file_dimensions: Tile size in pixels. 1024 keeps each tile ~268 MB uncompressed
             (1024*1024*64 bands*4 bytes); 2048 would exceed 1 GB per tile. Must be a
             multiple of the 256 px shard size.
-        max_pixels: Export ceiling; the AOI is ~2.7e9 pixels, so 1e13 is ample.
+        max_pixels: Export ceiling; the full AOI is ~2.8e9 pixels, so 1e13 is ample.
+        description: Earth Engine task name; defaults to alphaearth_embeddings_{year}.
+            Pass a distinct name (e.g. per fire) to avoid ambiguous duplicate task names.
 
     Returns:
         The started ee.batch.Task.
@@ -144,7 +193,7 @@ def export_embeddings_to_gcs(year, geometry, mask, bucket, prefix='embeddings',
     image = get_embedding_image(year, mask=mask)
     task = ee.batch.Export.image.toCloudStorage(
         image=image,
-        description=f'alphaearth_embeddings_forest_{year}',
+        description=description or f'alphaearth_embeddings_{year}',
         bucket=bucket,
         fileNamePrefix=f'{prefix}/{year}/embeddings_{year}',
         region=geometry,
